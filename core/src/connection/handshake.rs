@@ -7,9 +7,11 @@ use protobuf::{self, Message, MessageStatic};
 use rand::thread_rng;
 use std::io::{self, Read};
 use std::marker::PhantomData;
+use std::net::SocketAddr;
 use tokio_io::{AsyncRead, AsyncWrite};
 use tokio_io::codec::Framed;
-use tokio_io::io::{read_exact, write_all, ReadExact, Window, WriteAll};
+use tokio_io::io::{read as read_some, read_exact, write_all, Read as ReadSome, ReadExact, Window,
+                   WriteAll};
 
 use super::codec::APCodec;
 use diffie_hellman::DHLocalKeys;
@@ -26,15 +28,31 @@ enum HandshakeState<T> {
     ClientHello(WriteAll<T, Vec<u8>>),
     APResponse(RecvPacket<T, APResponseMessage>),
     ClientResponse(Option<APCodec>, WriteAll<T, Vec<u8>>),
+    ProxyConnect(WriteAll<T, Vec<u8>>),
+    ProxyResponse(ReadSome<T, Vec<u8>>),
 }
 
-pub fn handshake<T: AsyncRead + AsyncWrite>(connection: T) -> Handshake<T> {
+pub fn handshake<T: AsyncRead + AsyncWrite>(
+    connection: T,
+    connect_url: Option<SocketAddr>,
+) -> Handshake<T> {
     let local_keys = DHLocalKeys::random(&mut thread_rng());
-    let client_hello = client_hello(connection, local_keys.public_key());
 
-    Handshake {
-        keys: local_keys,
-        state: HandshakeState::ClientHello(client_hello),
+    match connect_url {
+        Some(connect_url) => {
+            let proxy = proxy_connect(connection, connect_url);
+            Handshake {
+                keys: local_keys,
+                state: HandshakeState::ProxyConnect(proxy),
+            }
+        }
+        None => {
+            let client_hello = client_hello(connection, local_keys.public_key());
+            Handshake {
+                keys: local_keys,
+                state: HandshakeState::ClientHello(client_hello),
+            }
+        }
     }
 }
 
@@ -48,7 +66,6 @@ impl<T: AsyncRead + AsyncWrite> Future for Handshake<T> {
             self.state = match self.state {
                 ClientHello(ref mut write) => {
                     let (connection, accumulator) = try_ready!(write.poll());
-
                     let read = recv_packet(connection, accumulator);
                     APResponse(read)
                 }
@@ -76,9 +93,52 @@ impl<T: AsyncRead + AsyncWrite> Future for Handshake<T> {
                     let framed = connection.framed(codec);
                     return Ok(Async::Ready(framed));
                 }
+
+                ProxyConnect(ref mut write) => {
+                    let (connection, accumulator) = try_ready!(write.poll());
+                    let read = read_some(connection, accumulator);
+                    ProxyResponse(read)
+                }
+
+                ProxyResponse(ref mut read) => {
+                    let (connection, accumulator, _bytes_read) = try_ready!(read.poll());
+                    if accumulator.len() >= 12 {
+                        if !(accumulator.starts_with(b"HTTP/1.1 200")
+                            || accumulator.starts_with(b"HTTP/1.0 200"))
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::Other,
+                                "Proxy server did not respons with 200 Ok",
+                            ));
+                        } else if accumulator.ends_with(b"\r\n\r\n") {
+                            // Proxy says all is good
+                            let client = client_hello(connection, self.keys.public_key());
+                            ClientHello(client)
+                        } else {
+                            // 200 OK recieved but the response header has not yet ended
+                            let read = read_some(connection, accumulator);
+                            ProxyResponse(read)
+                        }
+                    } else {
+                        // We did not get a full header
+                        let read = read_some(connection, accumulator);
+                        ProxyResponse(read)
+                    }
+                }
             }
         }
     }
+}
+
+fn proxy_connect<T: AsyncWrite>(connection: T, connect_url: SocketAddr) -> WriteAll<T, Vec<u8>> {
+    let buffer = format!(
+        "CONNECT {0}:{1} HTTP/1.1\r\n\
+         \r\n",
+        connect_url.ip(),
+        connect_url.port()
+    ).into_bytes();
+
+    write_all(connection, buffer)
 }
 
 fn client_hello<T: AsyncWrite>(connection: T, gc: Vec<u8>) -> WriteAll<T, Vec<u8>> {
